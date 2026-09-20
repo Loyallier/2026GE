@@ -253,8 +253,8 @@ def extract_all_tables(page: Page) -> list[dict[str, Any]]:
 def wait_for_round1_page(context: BrowserContext) -> Page:
     print("\n浏览器已打开。")
     print("1) 请在【这个 Playwright Chromium 窗口】里手动登录 AC Online。")
-    print("2) 登录后进入你希望持续观察的 Xk 页面。")
-    print("3) 程序会扫描 Chromium 的所有标签页；检测到 c=Xk 后自动开始。\n")
+    print("2) 正常点击菜单进入你希望观察的选课页面即可。")
+    print("3) 程序会扫描所有标签页 + 所有 iframe；发现 c=Xk 后自动开始。\n")
 
     last_report = ""
     stable_url = ""
@@ -266,45 +266,56 @@ def wait_for_round1_page(context: BrowserContext) -> Page:
         if not pages:
             raise BrowserClosed("All Chromium pages were closed.")
 
-        candidates: list[Page] = []
-        report_urls: list[str] = []
+        candidates: list[tuple[Page, str, bool]] = []
+        report_parts: list[str] = []
 
-        for p in pages:
+        for pi, p in enumerate(pages, start=1):
             try:
-                current = p.url
-                report_urls.append(current)
-                if is_xk_page(p) and p.locator("body").count() > 0:
-                    candidates.append(p)
+                frame_urls = []
+                for frame in p.frames:
+                    frame_url = (frame.url or "").strip()
+                    if not frame_url:
+                        continue
+                    frame_urls.append(frame_url)
+                    if "ac.xmu.edu.my" in frame_url.lower() and "c=xk" in frame_url.lower():
+                        candidates.append((p, frame_url, frame == p.main_frame))
+
+                compact_frames = " ; ".join(frame_urls[:6])
+                if len(frame_urls) > 6:
+                    compact_frames += f" ; ...(+{len(frame_urls) - 6})"
+                report_parts.append(f"tab{pi}: {compact_frames or '(no frame url)'}")
             except Exception:
                 continue
 
-        report = " | ".join(report_urls)
+        report = " | ".join(report_parts)
         now = time.monotonic()
         if report != last_report or now >= heartbeat_at:
-            print(f"[等待] 当前 {len(pages)} 个标签页: {report or '(empty)'}")
+            print(f"[等待] {report or '(no active page/frame)'}")
             last_report = report
             heartbeat_at = now + 5.0
 
         if candidates:
-            # Prefer the most recently opened Xk tab.
-            page = candidates[-1]
-            current = page.url
+            # Prefer the most recently opened page/frame.
+            page, target_url, is_main_frame = candidates[-1]
 
-            if current == stable_url:
+            if target_url == stable_url:
                 stable_hits += 1
             else:
-                stable_url = current
+                stable_url = target_url
                 stable_hits = 1
 
             if stable_hits >= 2:
-                print(f"\n已锁定采集页面: {current}")
+                if not is_main_frame:
+                    print(f"\n发现选课页面位于 iframe: {target_url}")
+                    print("正在把该页面提升到当前标签页，之后直接刷新这个真实选课 URL。")
+                    page.goto(target_url, wait_until="domcontentloaded")
+                print(f"\n已锁定采集页面: {page.url}")
                 return page
         else:
             stable_url = ""
             stable_hits = 0
 
         time.sleep(1.0)
-
 
 def capture_current_page(
     page: Page,
