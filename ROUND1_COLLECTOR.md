@@ -45,6 +45,27 @@ python round1_collector.py --interval 2
 Ctrl+C
 ```
 
+> Windows / PowerShell：请确保焦点在 PowerShell 窗口里再按 Ctrl+C。新版会直接退出，不再等待下一轮。
+>
+> 如果你直接手动关闭 Chromium，新版也会检测到并自动结束 Python 采集进程。
+
+如果旧版本已经出现“浏览器关了但 Python 还在”的情况，可以在 PowerShell 中定位并强制停止：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Select-Object ProcessId, CommandLine
+
+Stop-Process -Id <PID> -Force
+```
+
+页面窗口现在使用 Chromium 原生 viewport，可以自由缩放窗口；页面缩放使用：
+
+```text
+Ctrl+-   缩小
+Ctrl+=   放大
+Ctrl+0   恢复 100%
+```
+
 ## 数据
 
 每次运行创建一个独立目录：
