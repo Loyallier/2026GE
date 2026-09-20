@@ -156,6 +156,39 @@ def make_session(context) -> requests.Session:
     return session
 
 
+def summarize_target_html(html: str) -> str:
+    """Human-readable proof that background HTTP fetched the intended page."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        title = soup.title.get_text(" ", strip=True) if soup.title else "(no title)"
+        table = soup.find("table", id="data_table")
+        if not table:
+            return f"title={title} | data_table=not found"
+
+        rows = []
+        for tr in table.find_all("tr")[1:]:
+            cells = tr.find_all(["th", "td"], recursive=False)
+            if len(cells) >= 3:
+                no = cells[0].get_text(" ", strip=True)
+                if no.isdigit():
+                    rows.append((
+                        cells[1].get_text(" ", strip=True),
+                        cells[2].get_text(" ", strip=True),
+                    ))
+
+        if not rows:
+            return f"title={title} | data_table found | course_rows=0"
+
+        first = f"{rows[0][0]} {rows[0][1]}"
+        last = f"{rows[-1][0]} {rows[-1][1]}"
+        return (
+            f"title={title} | course_rows={len(rows)} | "
+            f"first={first} | last={last}"
+        )
+    except Exception as exc:
+        return f"verification parse failed: {exc}"
+
+
 def extract_all_tables(html: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     result: list[dict[str, Any]] = []
