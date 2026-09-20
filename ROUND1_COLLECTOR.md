@@ -153,3 +153,36 @@ collector_data/round1_.../live_latest.csv
 它是“当前最新状态”，完整历史仍以 `snapshots.sqlite3` 为准。
 
 Windows 上不要长期用 Excel 打开 `live_latest.csv`，Excel 可能锁文件导致实时 CSV 暂时无法替换；PowerShell 中的 LIVE 输出和 SQLite 原始采集不受影响。
+
+
+## 旧协议保底采集器
+
+`legacy_protocol_collector.py` 保留去年 `ac_sniper_V2.py / ac_checkpoints_v2.py` 的核心协议：
+
+```text
+GET Random 页面
+→ 提取 __VIEWSTATE
+→ POST $All
+→ 解析第 1 页
+→ 更新 __VIEWSTATE
+→ POST $Page / $2
+→ 解析第 2 页
+```
+
+改动只有登录、存储和调度：
+
+- 登录：弹 Chromium 手动登录，再把浏览器 Cookie 注入 `requests.Session`
+- 存储：每轮课程数据 + GET/$All/$Page 原始 HTML 全部保存到 SQLite
+- 调度：固定高频循环，不做周期预测
+
+正式开放后，确认本轮 Random URL，例如：
+
+```powershell
+python legacy_protocol_collector.py --url "https://ac.xmu.edu.my/student/index.php?c=Xk&a=Random&id=1402" --pages 2 --interval 3
+```
+
+`id=1402` 是旧值，正式运行前必须确认当轮 ID。
+
+它使用独立的 `.legacy_protocol_profile/`，因此可以和 `round1_collector.py` 同时运行，但需要各自完成一次浏览器登录。
+
+注意：旧逻辑会 POST `$All`，也就是切到 All Courses 视图。这是刻意保留的旧行为。
