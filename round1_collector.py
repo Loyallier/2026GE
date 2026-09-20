@@ -250,41 +250,57 @@ def extract_all_tables(page: Page) -> list[dict[str, Any]]:
     )
 
 
-def wait_for_round1_page(page: Page) -> str:
+def wait_for_round1_page(context: BrowserContext) -> Page:
     print("\n浏览器已打开。")
-    print("1) 请手动登录 AC Online。")
-    print("2) 登录后进入【第一轮选课】中你希望持续观察的课程列表页面。")
-    print("3) 程序检测到 c=Xk 页面后会自动开始，不需要复制 Cookie/Token。\n")
+    print("1) 请在【这个 Playwright Chromium 窗口】里手动登录 AC Online。")
+    print("2) 登录后进入你希望持续观察的 Xk 页面。")
+    print("3) 程序会扫描 Chromium 的所有标签页；检测到 c=Xk 后自动开始。\n")
 
-    last_url = ""
+    last_report = ""
+    stable_url = ""
     stable_hits = 0
+    heartbeat_at = 0.0
 
     while True:
-        if page.is_closed():
-            raise BrowserClosed("Chromium window was closed.")
+        pages = [p for p in context.pages if not p.is_closed()]
+        if not pages:
+            raise BrowserClosed("All Chromium pages were closed.")
 
-        try:
+        candidates: list[Page] = []
+        report_urls: list[str] = []
+
+        for p in pages:
+            try:
+                current = p.url
+                report_urls.append(current)
+                if is_xk_page(p) and p.locator("body").count() > 0:
+                    candidates.append(p)
+            except Exception:
+                continue
+
+        report = " | ".join(report_urls)
+        now = time.monotonic()
+        if report != last_report or now >= heartbeat_at:
+            print(f"[等待] 当前 {len(pages)} 个标签页: {report or '(empty)'}")
+            last_report = report
+            heartbeat_at = now + 5.0
+
+        if candidates:
+            # Prefer the most recently opened Xk tab.
+            page = candidates[-1]
             current = page.url
-            if current != last_url:
-                print(f"[浏览器] {current}")
-                last_url = current
 
-            if is_xk_page(page):
-                if page.locator("body").count() > 0:
-                    stable_hits += 1
-                else:
-                    stable_hits = 0
-
-                if stable_hits >= 2:
-                    print(f"\n已锁定采集页面: {current}")
-                    return current
+            if current == stable_url:
+                stable_hits += 1
             else:
-                stable_hits = 0
-        except BrowserClosed:
-            raise
-        except Exception:
-            if page.is_closed():
-                raise BrowserClosed("Chromium window was closed.")
+                stable_url = current
+                stable_hits = 1
+
+            if stable_hits >= 2:
+                print(f"\n已锁定采集页面: {current}")
+                return page
+        else:
+            stable_url = ""
             stable_hits = 0
 
         time.sleep(1.0)
@@ -384,7 +400,9 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
             except PlaywrightTimeoutError:
                 print("登录页加载超时，但浏览器已打开；你仍可手动刷新/登录。")
 
-            wait_for_round1_page(page)
+            page = wait_for_round1_page(context)
+            page.set_default_timeout(timeout_ms)
+            page.set_default_navigation_timeout(timeout_ms)
             print("\n开始采集。程序只刷新当前页面，不执行选课/退课动作。")
             print("窗口现在可自由缩放/最大化；页面缩放可直接用 Ctrl+- / Ctrl++ / Ctrl+0。\n")
 
@@ -414,7 +432,9 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
 
                 if is_login_page(page):
                     print("\n登录状态失效。请在浏览器重新登录并回到第一轮选课页面。")
-                    wait_for_round1_page(page)
+                    page = wait_for_round1_page(context)
+                    page.set_default_timeout(timeout_ms)
+                    page.set_default_navigation_timeout(timeout_ms)
                     print("检测到选课页，继续采集。\n")
 
                 started = time.perf_counter()
@@ -471,7 +491,9 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
                         f"\n页面离开了选课界面: {page.url}\n"
                         "请在浏览器重新进入第一轮选课页面，检测到后自动继续。"
                     )
-                    wait_for_round1_page(page)
+                    page = wait_for_round1_page(context)
+                    page.set_default_timeout(timeout_ms)
+                    page.set_default_navigation_timeout(timeout_ms)
 
             context.close()
 
