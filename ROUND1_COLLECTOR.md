@@ -131,3 +131,25 @@ collector_data/
 - 固定表格索引解析。
 
 如果页面结构今年发生变化，最坏情况也应该只是“后续需要重新解析保存下来的 HTML”，而不是当场丢数据。
+
+
+## 实时查看
+
+采集器会先保存原始快照，然后再尝试解析当前 `data_table` 作为实时视图。实时解析失败不会影响原始采集。
+
+首次识别成功时，PowerShell 会打印当前全部课程；之后只有申请人数发生变化时才打印，例如：
+
+```text
+[LIVE] 当前课程人数 / 变化
+  G0111    Elementary Number Theory ...              申请  132 / 86    Δ +1
+```
+
+每轮还会更新：
+
+```text
+collector_data/round1_.../live_latest.csv
+```
+
+它是“当前最新状态”，完整历史仍以 `snapshots.sqlite3` 为准。
+
+Windows 上不要长期用 Excel 打开 `live_latest.csv`，Excel 可能锁文件导致实时 CSV 暂时无法替换；PowerShell 中的 LIVE 输出和 SQLite 原始采集不受影响。
