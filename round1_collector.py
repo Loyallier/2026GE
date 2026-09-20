@@ -530,23 +530,99 @@ def goto_with_navigation_retry(page: Page, url: str, timeout_ms: int) -> Respons
     raise last_exc
 
 
-def parse_live_courses(html: str) -> list[dict[str, Any]]:
-    """
-    Best-effort live view only. Raw snapshot saving never depends on this.
+def _norm_header(text: str) -> str:
+    return " ".join((text or "").strip().lower().replace("\n", " ").split())
 
-    Reuses the fork's current data_table parser when available.
+
+def _find_header(headers: list[str], aliases: set[str]) -> int | None:
+    normalized = [_norm_header(h) for h in headers]
+    for i, h in enumerate(normalized):
+        if h in aliases:
+            return i
+    for i, h in enumerate(normalized):
+        if any(alias in h for alias in aliases):
+            return i
+    return None
+
+
+def parse_live_courses(html: str) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Header-driven live parser.
+
+    Never assumes fixed table number or fixed column indices. It only reports
+    applicant/enrolled counts when such a column is actually present.
     """
     try:
-        from xmum.parser import parse_available_courses
-        return parse_available_courses(html)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
     except Exception:
-        return []
+        return [], False
 
+    code_aliases = {"course code", "code"}
+    name_aliases = {"course information (by group)", "course name", "name", "course"}
+    quota_aliases = {"quota", "limit", "capacity", "limitation"}
+    applicant_aliases = {
+        "applicant", "applicants", "applicant no.", "applicant no",
+        "enrolled", "enrolment", "enrollment", "current"
+    }
+    option_aliases = {"option", "status"}
+
+    best: list[dict[str, Any]] = []
+    best_has_applicant = False
+
+    for table in soup.find_all("table"):
+        header_row = table.find("tr")
+        if not header_row:
+            continue
+        headers = [cell.get_text(" ", strip=True) for cell in header_row.find_all(["th", "td"])]
+        if not headers:
+            continue
+
+        code_i = _find_header(headers, code_aliases)
+        name_i = _find_header(headers, name_aliases)
+        quota_i = _find_header(headers, quota_aliases)
+        applicant_i = _find_header(headers, applicant_aliases)
+        option_i = _find_header(headers, option_aliases)
+
+        if code_i is None or name_i is None:
+            continue
+
+        parsed: list[dict[str, Any]] = []
+        for tr in table.find_all("tr")[1:]:
+            cells = tr.find_all(["td", "th"], recursive=False)
+            if max(code_i, name_i) >= len(cells):
+                continue
+
+            code = cells[code_i].get_text(" ", strip=True)
+            name = cells[name_i].get_text(" ", strip=True)
+            if not code or not name or code.lower() in {"code", "course code"}:
+                continue
+
+            def cell_text(idx: int | None) -> str:
+                return cells[idx].get_text(" ", strip=True) if idx is not None and idx < len(cells) else ""
+
+            def maybe_int(text: str) -> int | None:
+                m = re.search(r"-?\d+", text or "")
+                return int(m.group()) if m else None
+
+            parsed.append({
+                "code": code,
+                "name": name,
+                "quota": maybe_int(cell_text(quota_i)),
+                "applicant": maybe_int(cell_text(applicant_i)) if applicant_i is not None else None,
+                "option": cell_text(option_i),
+            })
+
+        if len(parsed) > len(best):
+            best = parsed
+            best_has_applicant = applicant_i is not None
+
+    return best, best_has_applicant
 
 def write_live_csv(path: Path, courses: list[dict[str, Any]]) -> None:
     """Atomically replace the latest live CSV so readers never see half a file."""
     tmp = path.with_suffix(".tmp")
-    fields = ["code", "name", "quota", "applicant", "remaining", "credit", "field"]
+    fields = ["code", "name", "quota", "applicant", "option"]
     with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -569,41 +645,56 @@ def update_live_view(
     force_print: bool = False,
 ) -> dict[str, int] | None:
     """
-    Write latest course counts and print only meaningful changes.
-    Failure is intentionally non-fatal.
+    Write the latest course list. Applicant changes are shown only when the
+    page really contains an Applicant/Enrolled column.
     """
     try:
         html = page.content()
-        courses = parse_live_courses(html)
+        courses, has_applicant = parse_live_courses(html)
         if not courses:
             return previous
 
         write_live_csv(session_dir / "live_latest.csv", courses)
 
+        if not has_applicant:
+            if force_print:
+                print(
+                    f"\n[LIVE] 已识别 {len(courses)} 门/组课程；"
+                    "当前页面没有 Applicant/Enrolled 列，只显示 Quota。"
+                )
+                for course in courses:
+                    quota = course.get("quota")
+                    print(
+                        f"  {course.get('code',''):<10} "
+                        f"{course.get('name','')[:56]:<56} "
+                        f"Quota {quota if quota is not None else '?'}"
+                    )
+                print(f"[LIVE] 最新完整表: {session_dir / 'live_latest.csv'}\n")
+            return previous
+
         current: dict[str, int] = {}
         changes: list[tuple[dict[str, Any], int | None, int]] = []
 
         for course in courses:
+            applicant = course.get("applicant")
+            if applicant is None:
+                continue
             key = f"{course.get('code','')}|{course.get('name','')}"
-            applicant = int(course.get("applicant", -1))
-            current[key] = applicant
+            current[key] = int(applicant)
             old = previous.get(key) if previous else None
-            if force_print or old is None or applicant != old:
-                changes.append((course, old, applicant))
+            if force_print or old is None or int(applicant) != old:
+                changes.append((course, old, int(applicant)))
 
         if changes:
-            print("\n[LIVE] 当前课程人数 / 变化")
+            print("\n[LIVE] 当前课程申请人数 / 变化")
             for course, old, applicant in changes:
-                quota = course.get("quota", -1)
-                if old is None:
-                    delta = "初始"
-                else:
-                    d = applicant - old
-                    delta = f"{d:+d}"
+                quota = course.get("quota")
+                delta = "初始" if old is None else f"{applicant - old:+d}"
                 print(
-                    f"  {course.get('code',''):<8} "
+                    f"  {course.get('code',''):<10} "
                     f"{course.get('name','')[:52]:<52} "
-                    f"申请 {applicant:>4} / {quota:<4}  Δ {delta}"
+                    f"申请 {applicant:>4} / "
+                    f"{quota if quota is not None else '?':<4}  Δ {delta}"
                 )
             print(f"[LIVE] 最新完整表: {session_dir / 'live_latest.csv'}\n")
 
@@ -611,7 +702,6 @@ def update_live_view(
     except Exception as exc:
         print(f"[LIVE] 实时视图解析失败（原始采集不受影响）: {exc}")
         return previous
-
 
 def run(interval: float, settle: float, timeout_ms: int, target_url: str | None) -> None:
     session_dir, db_path, jsonl_path = build_paths()
