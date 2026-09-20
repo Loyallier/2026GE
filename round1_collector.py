@@ -30,6 +30,7 @@ import os
 import sqlite3
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -255,6 +256,25 @@ def _looks_like_xk(url: str) -> bool:
     return "ac.xmu.edu.my" in u and "c=xk" in u
 
 
+def wait_for_enter_or_browser_close(context: BrowserContext, prompt: str) -> None:
+    """Wait for Enter without becoming blind to the browser being closed."""
+    done = threading.Event()
+
+    def _reader() -> None:
+        try:
+            input(prompt)
+        finally:
+            done.set()
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    while not done.is_set():
+        pages = [p for p in context.pages if not p.is_closed()]
+        if not pages:
+            raise BrowserClosed("All Chromium pages were closed.")
+        time.sleep(0.2)
+
+
 def choose_target_after_manual_navigation(
     context: BrowserContext,
     recent_urls: list[str],
@@ -279,7 +299,7 @@ def choose_target_after_manual_navigation(
         "程序会根据你刚才真实产生的网络请求自动找 c=Xk URL。\n"
     )
 
-    input("目标页面已就绪后按 Enter > ")
+    wait_for_enter_or_browser_close(context, "目标页面已就绪后按 Enter > ")
 
     pages = [p for p in context.pages if not p.is_closed()]
     if not pages:
