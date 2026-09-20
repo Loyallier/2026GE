@@ -21,6 +21,25 @@ playwright install chromium
 
 ## 运行
 
+## 推荐：正式采集使用直接 URL 模式
+
+如果已经知道目标选课页面的真实 URL，推荐直接：
+
+```powershell
+python round1_collector.py --url "https://ac.xmu.edu.my/student/index.php?c=Xk&a=view&id=531"
+```
+
+流程会变成：
+
+1. 打开 Chromium；
+2. 你手动登录；
+3. 程序检测登录页消失；
+4. 自动进入 `--url` 指定页面；
+5. 立即开始连续采集。
+
+这个模式不依赖首页菜单、iframe、AJAX 导航或 PowerShell Enter 交互，是正式第一轮最推荐的运行方式。
+
+
 ```bash
 python round1_collector.py
 ```
