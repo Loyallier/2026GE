@@ -250,72 +250,94 @@ def extract_all_tables(page: Page) -> list[dict[str, Any]]:
     )
 
 
-def wait_for_round1_page(context: BrowserContext) -> Page:
-    print("\n浏览器已打开。")
-    print("1) 请在【这个 Playwright Chromium 窗口】里手动登录 AC Online。")
-    print("2) 正常点击菜单进入你希望观察的选课页面即可。")
-    print("3) 程序会扫描所有标签页 + 所有 iframe；发现 c=Xk 后自动开始。\n")
+def _looks_like_xk(url: str) -> bool:
+    u = (url or "").lower()
+    return "ac.xmu.edu.my" in u and "c=xk" in u
 
-    last_report = ""
-    stable_url = ""
-    stable_hits = 0
-    heartbeat_at = 0.0
 
-    while True:
-        pages = [p for p in context.pages if not p.is_closed()]
-        if not pages:
-            raise BrowserClosed("All Chromium pages were closed.")
+def choose_target_after_manual_navigation(
+    context: BrowserContext,
+    recent_urls: list[str],
+    timeout_ms: int,
+) -> Page:
+    """
+    User decides when the desired screen is ready.
 
-        candidates: list[tuple[Page, str, bool]] = []
-        report_parts: list[str] = []
+    We deliberately do not depend on top-level URL/frame structure. After the
+    user presses Enter, prefer the most recent observed c=Xk network URL and
+    elevate it to a normal top-level page so subsequent reloads are reliable.
+    """
+    pages = [p for p in context.pages if not p.is_closed()]
+    if not pages:
+        raise BrowserClosed("All Chromium pages were closed.")
 
-        for pi, p in enumerate(pages, start=1):
-            try:
-                frame_urls = []
-                for frame in p.frames:
-                    frame_url = (frame.url or "").strip()
-                    if not frame_url:
-                        continue
-                    frame_urls.append(frame_url)
-                    if "ac.xmu.edu.my" in frame_url.lower() and "c=xk" in frame_url.lower():
-                        candidates.append((p, frame_url, frame == p.main_frame))
+    page = pages[-1]
 
-                compact_frames = " ; ".join(frame_urls[:6])
-                if len(frame_urls) > 6:
-                    compact_frames += f" ; ...(+{len(frame_urls) - 6})"
-                report_parts.append(f"tab{pi}: {compact_frames or '(no frame url)'}")
-            except Exception:
-                continue
+    print(
+        "\n请在这个 Chromium 里正常登录，然后进入你想持续观察的页面。\n"
+        "看到目标课程页面后，回到 PowerShell 按 Enter。\n"
+        "程序会根据你刚才真实产生的网络请求自动找 c=Xk URL。\n"
+    )
 
-        report = " | ".join(report_parts)
-        now = time.monotonic()
-        if report != last_report or now >= heartbeat_at:
-            print(f"[等待] {report or '(no active page/frame)'}")
-            last_report = report
-            heartbeat_at = now + 5.0
+    input("目标页面已就绪后按 Enter > ")
 
-        if candidates:
-            # Prefer the most recently opened page/frame.
-            page, target_url, is_main_frame = candidates[-1]
+    pages = [p for p in context.pages if not p.is_closed()]
+    if not pages:
+        raise BrowserClosed("All Chromium pages were closed.")
+    page = pages[-1]
 
-            if target_url == stable_url:
-                stable_hits += 1
-            else:
-                stable_url = target_url
-                stable_hits = 1
+    candidates: list[str] = []
+    seen = set()
 
-            if stable_hits >= 2:
-                if not is_main_frame:
-                    print(f"\n发现选课页面位于 iframe: {target_url}")
-                    print("正在把该页面提升到当前标签页，之后直接刷新这个真实选课 URL。")
-                    page.goto(target_url, wait_until="domcontentloaded")
-                print(f"\n已锁定采集页面: {page.url}")
-                return page
-        else:
-            stable_url = ""
-            stable_hits = 0
+    # Prefer what the browser currently exposes.
+    for p in reversed(pages):
+        try:
+            if _looks_like_xk(p.url) and p.url not in seen:
+                candidates.append(p.url)
+                seen.add(p.url)
+        except Exception:
+            pass
+        try:
+            for frame in reversed(p.frames):
+                if _looks_like_xk(frame.url) and frame.url not in seen:
+                    candidates.append(frame.url)
+                    seen.add(frame.url)
+        except Exception:
+            pass
 
-        time.sleep(1.0)
+    # Then prefer the most recent network-observed Xk URL.
+    for url in reversed(recent_urls):
+        if _looks_like_xk(url) and url not in seen:
+            candidates.append(url)
+            seen.add(url)
+
+    if candidates:
+        target = candidates[0]
+        print(f"\n发现真实选课 URL: {target}")
+        print("将它提升为独立顶层页面，之后只刷新这个 URL。")
+        page.set_default_timeout(timeout_ms)
+        page.set_default_navigation_timeout(timeout_ms)
+        page.goto(target, wait_until="domcontentloaded", timeout=timeout_ms)
+        print(f"已锁定采集页面: {page.url}")
+        return page
+
+    print(
+        "\n没有自动发现 c=Xk 网络 URL。"
+        "如果你知道真实 URL，可以直接粘贴；否则留空进入当前页面保底模式。"
+    )
+    manual_url = input("目标 URL（可留空）> ").strip()
+    if manual_url:
+        page.set_default_timeout(timeout_ms)
+        page.set_default_navigation_timeout(timeout_ms)
+        page.goto(manual_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        print(f"已锁定采集页面: {page.url}")
+        return page
+
+    print(
+        "⚠️ 未获得可直接刷新的真实 URL。将保存当前 DOM，"
+        "但不会自动 browser reload，避免把你从动态页面刷回主页。"
+    )
+    return page
 
 def capture_current_page(
     page: Page,
@@ -382,6 +404,16 @@ def build_paths() -> tuple[Path, Path, Path]:
     )
 
 
+def _is_closed_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "target page, context or browser has been closed" in msg
+        or "page closed" in msg
+        or "browser has been closed" in msg
+        or "context has been closed" in msg
+    )
+
+
 def run(interval: float, settle: float, timeout_ms: int) -> None:
     session_dir, db_path, jsonl_path = build_paths()
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -406,15 +438,31 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
             page.set_default_timeout(timeout_ms)
             page.set_default_navigation_timeout(timeout_ms)
 
+            recent_urls: list[str] = []
+
+            def remember_url(url: str) -> None:
+                if not url:
+                    return
+                recent_urls.append(url)
+                if len(recent_urls) > 500:
+                    del recent_urls[:-500]
+                if _looks_like_xk(url):
+                    print(f"[发现 Xk 请求] {url}")
+
+            context.on("request", lambda req: remember_url(req.url))
+            context.on("response", lambda resp: remember_url(resp.url))
+
             try:
                 page.goto(LOGIN_URL, wait_until="domcontentloaded")
             except PlaywrightTimeoutError:
                 print("登录页加载超时，但浏览器已打开；你仍可手动刷新/登录。")
 
-            page = wait_for_round1_page(context)
+            page = choose_target_after_manual_navigation(context, recent_urls, timeout_ms)
             page.set_default_timeout(timeout_ms)
             page.set_default_navigation_timeout(timeout_ms)
-            print("\n开始采集。程序只刷新当前页面，不执行选课/退课动作。")
+            direct_reload = _looks_like_xk(page.url)
+
+            print("\n开始采集。程序只观察页面，不执行选课/退课动作。")
             print("窗口现在可自由缩放/最大化；页面缩放可直接用 Ctrl+- / Ctrl++ / Ctrl+0。\n")
 
             previous_row_count: int | None = None
@@ -441,23 +489,23 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
                 if page.is_closed():
                     raise BrowserClosed("Chromium window was closed.")
 
-                if is_login_page(page):
-                    print("\n登录状态失效。请在浏览器重新登录并回到第一轮选课页面。")
-                    page = wait_for_round1_page(context)
-                    page.set_default_timeout(timeout_ms)
-                    page.set_default_navigation_timeout(timeout_ms)
-                    print("检测到选课页，继续采集。\n")
-
                 started = time.perf_counter()
                 response: Response | None = None
                 nav_error: str | None = None
 
-                try:
-                    response = page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
-                except PlaywrightTimeoutError as exc:
-                    nav_error = f"reload timeout: {exc}"
-                except Exception as exc:
-                    nav_error = f"reload failed: {exc}"
+                if direct_reload:
+                    try:
+                        response = page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                    except PlaywrightTimeoutError as exc:
+                        nav_error = f"reload timeout: {exc}"
+                    except Exception as exc:
+                        if _is_closed_error(exc):
+                            raise BrowserClosed("Chromium window was closed.") from exc
+                        nav_error = f"reload failed: {exc}"
+                else:
+                    # Dynamic-shell fallback: never reload index.php automatically,
+                    # because doing so may destroy the manually selected view.
+                    nav_error = "dynamic-shell fallback: DOM snapshot only, no reload"
 
                 load_ms = (time.perf_counter() - started) * 1000.0
 
@@ -494,17 +542,11 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
                         f"{warning}"
                     )
                 except Exception as exc:
+                    if _is_closed_error(exc) or page.is_closed():
+                        raise BrowserClosed("Chromium window was closed.") from exc
                     print(f"本轮保存失败: {exc}")
                     save_error_screenshot(page, session_dir, "capture_failed")
 
-                if not is_xk_page(page) and not is_login_page(page):
-                    print(
-                        f"\n页面离开了选课界面: {page.url}\n"
-                        "请在浏览器重新进入第一轮选课页面，检测到后自动继续。"
-                    )
-                    page = wait_for_round1_page(context)
-                    page.set_default_timeout(timeout_ms)
-                    page.set_default_navigation_timeout(timeout_ms)
 
             context.close()
 
