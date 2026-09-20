@@ -27,7 +27,6 @@ import gzip
 import hashlib
 import json
 import os
-import signal
 import sqlite3
 import sys
 import time
@@ -62,6 +61,10 @@ class CaptureResult:
     table_count: int
     row_count: int
     html_sha256: str
+
+
+class BrowserClosed(RuntimeError):
+    """The user closed the Chromium window/context."""
 
 
 class SnapshotStore:
@@ -257,6 +260,9 @@ def wait_for_round1_page(page: Page) -> str:
     stable_hits = 0
 
     while True:
+        if page.is_closed():
+            raise BrowserClosed("Chromium window was closed.")
+
         try:
             current = page.url
             if current != last_url:
@@ -274,7 +280,11 @@ def wait_for_round1_page(page: Page) -> str:
                     return current
             else:
                 stable_hits = 0
+        except BrowserClosed:
+            raise
         except Exception:
+            if page.is_closed():
+                raise BrowserClosed("Chromium window was closed.")
             stable_hits = 0
 
         time.sleep(1.0)
@@ -354,22 +364,13 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
     print("停止方式：Ctrl+C\n")
 
     store = SnapshotStore(db_path, jsonl_path)
-    stop_requested = False
-
-    def _stop(_signum, _frame):
-        nonlocal stop_requested
-        stop_requested = True
-
-    signal.signal(signal.SIGINT, _stop)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _stop)
 
     try:
         with sync_playwright() as p:
             context: BrowserContext = p.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
                 headless=False,
-                viewport={"width": 1440, "height": 1000},
+                no_viewport=True,
                 args=["--start-maximized"],
             )
 
@@ -384,7 +385,8 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
                 print("登录页加载超时，但浏览器已打开；你仍可手动刷新/登录。")
 
             wait_for_round1_page(page)
-            print("\n开始采集。程序只刷新当前页面，不执行选课/退课动作。\n")
+            print("\n开始采集。程序只刷新当前页面，不执行选课/退课动作。")
+            print("窗口现在可自由缩放/最大化；页面缩放可直接用 Ctrl+- / Ctrl++ / Ctrl+0。\n")
 
             previous_row_count: int | None = None
             snapshot_count = 0
@@ -401,8 +403,14 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
                 print(f"初始页面保存失败: {exc}")
                 save_error_screenshot(page, session_dir, "initial_capture_failed")
 
-            while not stop_requested:
+            while True:
+                if page.is_closed():
+                    raise BrowserClosed("Chromium window was closed.")
+
                 time.sleep(max(0.0, interval))
+
+                if page.is_closed():
+                    raise BrowserClosed("Chromium window was closed.")
 
                 if is_login_page(page):
                     print("\n登录状态失效。请在浏览器重新登录并回到第一轮选课页面。")
@@ -465,9 +473,12 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
                     )
                     wait_for_round1_page(page)
 
-            print(f"\n收到停止信号，共写入 {snapshot_count} 个采集快照。")
             context.close()
 
+    except KeyboardInterrupt:
+        print("\nCtrl+C：立即停止采集。")
+    except BrowserClosed:
+        print("\n检测到 Chromium 已关闭，自动停止采集。")
     finally:
         store.close()
         print(f"SQLite: {db_path}")
