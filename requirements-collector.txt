@@ -1,1 +1,4 @@
 playwright>=1.40,<2
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+urllib3>=2,<3
