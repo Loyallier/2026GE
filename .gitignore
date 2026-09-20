@@ -9,6 +9,7 @@ dump_*.html
 # Round 1 collector runtime data
 collector_data/
 .collector_profile/
+.legacy_protocol_profile/
 
 # Python
 __pycache__/
