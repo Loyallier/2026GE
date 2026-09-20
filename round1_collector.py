@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import hashlib
 import json
@@ -435,23 +436,181 @@ def _is_closed_error(exc: Exception) -> bool:
 
 
 def wait_until_logged_in(page: Page) -> None:
-    """Wait until the visible login form disappears; no Enter key required."""
+    """
+    Wait for login AND the school's post-login redirect chain to settle.
+
+    XMUM removes the login form before its automatic navigation to
+    /student/index.php?c=Default&a=inf is finished. Returning at that exact
+    moment races with page.goto(target_url), so require a stable post-login
+    URL for a short period.
+    """
     last_msg = 0.0
+    login_disappeared = False
+    last_url = ""
+    stable_since = 0.0
+
     while True:
         if page.is_closed():
             raise BrowserClosed("Chromium window was closed.")
+
         try:
-            if not is_login_page(page):
-                return
+            on_login = is_login_page(page)
+            current_url = page.url
+        except Exception as exc:
+            if _is_closed_error(exc):
+                raise BrowserClosed("Chromium window was closed.") from exc
+            time.sleep(0.2)
+            continue
+
+        now = time.monotonic()
+
+        if on_login:
+            login_disappeared = False
+            stable_since = 0.0
+            if now >= last_msg:
+                print("[等待登录] 请在 Chromium 中完成登录...")
+                last_msg = now + 5.0
+            time.sleep(0.3)
+            continue
+
+        if not login_disappeared:
+            print("[登录成功] 等待学校登录后的自动跳转稳定...")
+            login_disappeared = True
+            last_url = current_url
+            stable_since = now
+
+        if current_url != last_url:
+            print(f"[登录跳转] {current_url}")
+            last_url = current_url
+            stable_since = now
+
+        # Require a stable URL for 1.5s after the login page disappears.
+        if now - stable_since >= 1.5:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=1500)
+            except Exception:
+                pass
+            print(f"[登录就绪] {page.url}")
+            return
+
+        time.sleep(0.2)
+
+
+def goto_with_navigation_retry(page: Page, url: str, timeout_ms: int) -> Response | None:
+    """Navigate after login; tolerate XMUM finishing a competing redirect."""
+    last_exc: Exception | None = None
+
+    for attempt in range(1, 6):
+        if page.is_closed():
+            raise BrowserClosed("Chromium window was closed.")
+
+        try:
+            return page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as exc:
             if _is_closed_error(exc):
                 raise BrowserClosed("Chromium window was closed.") from exc
 
-        now = time.monotonic()
-        if now >= last_msg:
-            print("[等待登录] 请在 Chromium 中完成登录...")
-            last_msg = now + 5.0
-        time.sleep(0.5)
+            last_exc = exc
+            msg = str(exc).lower()
+            transient = (
+                "interrupted by another navigation" in msg
+                or "navigation to" in msg and "interrupted" in msg
+            )
+            if not transient:
+                raise
+
+            print(f"[导航竞争] 学校仍在自动跳转，等待后重试 ({attempt}/5)...")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=2000)
+            except Exception:
+                pass
+            time.sleep(0.8)
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def parse_live_courses(html: str) -> list[dict[str, Any]]:
+    """
+    Best-effort live view only. Raw snapshot saving never depends on this.
+
+    Reuses the fork's current data_table parser when available.
+    """
+    try:
+        from xmum.parser import parse_available_courses
+        return parse_available_courses(html)
+    except Exception:
+        return []
+
+
+def write_live_csv(path: Path, courses: list[dict[str, Any]]) -> None:
+    """Atomically replace the latest live CSV so readers never see half a file."""
+    tmp = path.with_suffix(".tmp")
+    fields = ["code", "name", "quota", "applicant", "remaining", "credit", "field"]
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(courses)
+    try:
+        os.replace(tmp, path)
+    except PermissionError:
+        # Excel may lock live_latest.csv on Windows. Keep collection running.
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def update_live_view(
+    page: Page,
+    session_dir: Path,
+    previous: dict[str, int] | None,
+    *,
+    force_print: bool = False,
+) -> dict[str, int] | None:
+    """
+    Write latest course counts and print only meaningful changes.
+    Failure is intentionally non-fatal.
+    """
+    try:
+        html = page.content()
+        courses = parse_live_courses(html)
+        if not courses:
+            return previous
+
+        write_live_csv(session_dir / "live_latest.csv", courses)
+
+        current: dict[str, int] = {}
+        changes: list[tuple[dict[str, Any], int | None, int]] = []
+
+        for course in courses:
+            key = f"{course.get('code','')}|{course.get('name','')}"
+            applicant = int(course.get("applicant", -1))
+            current[key] = applicant
+            old = previous.get(key) if previous else None
+            if force_print or old is None or applicant != old:
+                changes.append((course, old, applicant))
+
+        if changes:
+            print("\n[LIVE] 当前课程人数 / 变化")
+            for course, old, applicant in changes:
+                quota = course.get("quota", -1)
+                if old is None:
+                    delta = "初始"
+                else:
+                    d = applicant - old
+                    delta = f"{d:+d}"
+                print(
+                    f"  {course.get('code',''):<8} "
+                    f"{course.get('name','')[:52]:<52} "
+                    f"申请 {applicant:>4} / {quota:<4}  Δ {delta}"
+                )
+            print(f"[LIVE] 最新完整表: {session_dir / 'live_latest.csv'}\n")
+
+        return current
+    except Exception as exc:
+        print(f"[LIVE] 实时视图解析失败（原始采集不受影响）: {exc}")
+        return previous
 
 
 def run(interval: float, settle: float, timeout_ms: int, target_url: str | None) -> None:
@@ -486,8 +645,8 @@ def run(interval: float, settle: float, timeout_ms: int, target_url: str | None)
                     print("登录页加载超时，但浏览器已打开；你仍可手动刷新。")
 
                 wait_until_logged_in(page)
-                print("检测到登录完成，进入目标页面...")
-                page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                print("检测到登录流程稳定，进入目标页面...")
+                goto_with_navigation_retry(page, target_url, timeout_ms)
                 print(f"已锁定采集页面: {page.url}")
                 direct_reload = True
             else:
@@ -521,6 +680,7 @@ def run(interval: float, settle: float, timeout_ms: int, target_url: str | None)
             print("窗口现在可自由缩放/最大化；页面缩放可直接用 Ctrl+- / Ctrl++ / Ctrl+0。\n")
 
             previous_row_count: int | None = None
+            live_state: dict[str, int] | None = None
             snapshot_count = 0
 
             try:
@@ -530,6 +690,9 @@ def run(interval: float, settle: float, timeout_ms: int, target_url: str | None)
                 print(
                     f"[{result.captured_at}] #{result.snapshot_id} 初始页 "
                     f"tables={result.table_count} rows={result.row_count}"
+                )
+                live_state = update_live_view(
+                    page, session_dir, live_state, force_print=True
                 )
             except Exception as exc:
                 print(f"初始页面保存失败: {exc}")
@@ -596,6 +759,7 @@ def run(interval: float, settle: float, timeout_ms: int, target_url: str | None)
                         f"tables={result.table_count} rows={result.row_count}"
                         f"{warning}"
                     )
+                    live_state = update_live_view(page, session_dir, live_state)
                 except Exception as exc:
                     if _is_closed_error(exc) or page.is_closed():
                         raise BrowserClosed("Chromium window was closed.") from exc
