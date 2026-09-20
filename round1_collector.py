@@ -434,7 +434,27 @@ def _is_closed_error(exc: Exception) -> bool:
     )
 
 
-def run(interval: float, settle: float, timeout_ms: int) -> None:
+def wait_until_logged_in(page: Page) -> None:
+    """Wait until the visible login form disappears; no Enter key required."""
+    last_msg = 0.0
+    while True:
+        if page.is_closed():
+            raise BrowserClosed("Chromium window was closed.")
+        try:
+            if not is_login_page(page):
+                return
+        except Exception as exc:
+            if _is_closed_error(exc):
+                raise BrowserClosed("Chromium window was closed.") from exc
+
+        now = time.monotonic()
+        if now >= last_msg:
+            print("[等待登录] 请在 Chromium 中完成登录...")
+            last_msg = now + 5.0
+        time.sleep(0.5)
+
+
+def run(interval: float, settle: float, timeout_ms: int, target_url: str | None) -> None:
     session_dir, db_path, jsonl_path = build_paths()
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -458,29 +478,44 @@ def run(interval: float, settle: float, timeout_ms: int) -> None:
             page.set_default_timeout(timeout_ms)
             page.set_default_navigation_timeout(timeout_ms)
 
-            recent_urls: list[str] = []
+            if target_url:
+                print(f"目标 URL: {target_url}")
+                try:
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+                except PlaywrightTimeoutError:
+                    print("登录页加载超时，但浏览器已打开；你仍可手动刷新。")
 
-            def remember_url(url: str) -> None:
-                if not url:
-                    return
-                recent_urls.append(url)
-                if len(recent_urls) > 500:
-                    del recent_urls[:-500]
-                if _looks_like_xk(url):
-                    print(f"[发现 Xk 请求] {url}")
+                wait_until_logged_in(page)
+                print("检测到登录完成，进入目标页面...")
+                page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                print(f"已锁定采集页面: {page.url}")
+                direct_reload = True
+            else:
+                recent_urls: list[str] = []
+                seen_xk_urls: set[str] = set()
 
-            context.on("request", lambda req: remember_url(req.url))
-            context.on("response", lambda resp: remember_url(resp.url))
+                def remember_url(url: str) -> None:
+                    if not url:
+                        return
+                    recent_urls.append(url)
+                    if len(recent_urls) > 500:
+                        del recent_urls[:-500]
+                    if _looks_like_xk(url) and url not in seen_xk_urls:
+                        seen_xk_urls.add(url)
+                        print(f"[发现 Xk 请求] {url}")
 
-            try:
-                page.goto(LOGIN_URL, wait_until="domcontentloaded")
-            except PlaywrightTimeoutError:
-                print("登录页加载超时，但浏览器已打开；你仍可手动刷新/登录。")
+                context.on("request", lambda req: remember_url(req.url))
+                context.on("response", lambda resp: remember_url(resp.url))
 
-            page = choose_target_after_manual_navigation(context, recent_urls, timeout_ms)
-            page.set_default_timeout(timeout_ms)
-            page.set_default_navigation_timeout(timeout_ms)
-            direct_reload = _looks_like_xk(page.url)
+                try:
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+                except PlaywrightTimeoutError:
+                    print("登录页加载超时，但浏览器已打开；你仍可手动刷新/登录。")
+
+                page = choose_target_after_manual_navigation(context, recent_urls, timeout_ms)
+                page.set_default_timeout(timeout_ms)
+                page.set_default_navigation_timeout(timeout_ms)
+                direct_reload = _looks_like_xk(page.url)
 
             print("\n开始采集。程序只观察页面，不执行选课/退课动作。")
             print("窗口现在可自由缩放/最大化；页面缩放可直接用 Ctrl+- / Ctrl++ / Ctrl+0。\n")
@@ -585,6 +620,12 @@ def parse_args() -> argparse.Namespace:
         description="XMUM 第一轮只读全量页面采集器（手动登录，自动刷新，全量保存）"
     )
     parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="直接指定要持续刷新的 c=Xk 页面 URL；推荐正式采集时使用",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=DEFAULT_INTERVAL,
@@ -615,6 +656,7 @@ def main() -> None:
         interval=args.interval,
         settle=args.settle,
         timeout_ms=int(args.timeout * 1000),
+        target_url=args.url,
     )
 
 
