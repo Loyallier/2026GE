@@ -186,3 +186,36 @@ python legacy_protocol_collector.py --url "https://ac.xmu.edu.my/student/index.p
 它使用独立的 `.legacy_protocol_profile/`，因此可以和 `round1_collector.py` 同时运行，但需要各自完成一次浏览器登录。
 
 注意：旧逻辑会 POST `$All`，也就是切到 All Courses 视图。这是刻意保留的旧行为。
+
+
+## 数据分析与可视化
+
+`analyze_round1.py` 可以读取停止后的 SQLite，也可以直接读取仍在 WAL 模式持续写入的 `snapshots.sqlite3`。分析器会先通过 SQLite backup API 取得一致的只读快照，不修改采集数据库。
+
+运行：
+
+```powershell
+python analyze_round1.py "E:\work\2026GE\collector_data\round1_YYYYMMDD_HHMMSS\snapshots.sqlite3"
+```
+
+可指定输出目录：
+
+```powershell
+python analyze_round1.py "E:\...\snapshots.sqlite3" --out "E:\work\round1_analysis"
+```
+
+输出包括：
+
+- `report.json`：机器可读完整摘要，推荐直接发给 ChatGPT 继续分析
+- `course_timeseries.csv`：每个 snapshot 中每门/组课程的解析结果
+- `course_summary.csv`：每门/组课程的起止人数、净变化、quota 比例、最近窗口变化等
+- `change_events.csv`：Applicant 真正发生变化的事件
+- `state_events.csv`：available / selected 状态切换
+- `report.html`：人类可读汇总
+- `applicant_trends.png`：Applicant 时间序列
+- `latest_demand_ratio.png`：最新 Applicant / Quota
+- `change_waves.png`：全局人数变化波
+
+分析器会把 `data_table` 与 `data_table2` 合并，因此课程被选中后从可选表移入已选表，不会在历史趋势中消失。
+
+`refresh_waves` 统计的是“至少一门课程显示人数发生改变”的观察时刻，可用于判断今年是否仍存在类似往年约 284 秒的显示层刷新周期。它代表观察到的页面状态变化，不等同于后台真实交易时间。
