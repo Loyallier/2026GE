@@ -550,8 +550,10 @@ def parse_live_courses(html: str) -> tuple[list[dict[str, Any]], bool]:
     """
     Header-driven live parser.
 
-    Never assumes fixed table number or fixed column indices. It only reports
-    applicant/enrolled counts when such a column is actually present.
+    Merge BOTH the available-course table (data_table) and the selected-course
+    table (data_table2). XMUM moves a chosen course out of data_table and into
+    data_table2, so looking at only the largest table makes selected courses
+    appear to disappear even though the raw snapshot contains them.
     """
     try:
         from bs4 import BeautifulSoup
@@ -568,62 +570,95 @@ def parse_live_courses(html: str) -> tuple[list[dict[str, Any]], bool]:
     }
     option_aliases = {"option", "status"}
 
-    best: list[dict[str, Any]] = []
-    best_has_applicant = False
+    merged: dict[str, dict[str, Any]] = {}
+    any_applicant = False
 
     for table in soup.find_all("table"):
         header_row = table.find("tr")
         if not header_row:
             continue
-        headers = [cell.get_text(" ", strip=True) for cell in header_row.find_all(["th", "td"])]
+
+        headers = [
+            cell.get_text(" ", strip=True)
+            for cell in header_row.find_all(["th", "td"], recursive=False)
+        ]
         if not headers:
             continue
 
+        normalized_headers = [_norm_header(h) for h in headers]
         code_i = _find_header(headers, code_aliases)
-        name_i = _find_header(headers, name_aliases)
         quota_i = _find_header(headers, quota_aliases)
         applicant_i = _find_header(headers, applicant_aliases)
         option_i = _find_header(headers, option_aliases)
 
+        is_selected_table = (
+            table.get("id") == "data_table2"
+            or "wishing list" in normalized_headers
+            or "cancel" in normalized_headers
+        )
+
+        # XMUM labels column 2 of data_table2 as "Waiting List", but the row
+        # value is actually the course/group name.
+        if is_selected_table and len(headers) >= 2:
+            name_i = 1
+        else:
+            name_i = _find_header(headers, name_aliases)
+
         if code_i is None or name_i is None:
             continue
 
-        parsed: list[dict[str, Any]] = []
+        if applicant_i is not None:
+            any_applicant = True
+
         for tr in table.find_all("tr")[1:]:
             cells = tr.find_all(["td", "th"], recursive=False)
             if max(code_i, name_i) >= len(cells):
                 continue
 
-            code = cells[code_i].get_text(" ", strip=True)
-            name = cells[name_i].get_text(" ", strip=True)
-            if not code or not name or code.lower() in {"code", "course code"}:
-                continue
-
             def cell_text(idx: int | None) -> str:
-                return cells[idx].get_text(" ", strip=True) if idx is not None and idx < len(cells) else ""
+                return (
+                    cells[idx].get_text(" ", strip=True)
+                    if idx is not None and idx < len(cells)
+                    else ""
+                )
 
             def maybe_int(text: str) -> int | None:
                 m = re.search(r"-?\d+", text or "")
                 return int(m.group()) if m else None
 
-            parsed.append({
+            code = cell_text(code_i)
+            name = cell_text(name_i)
+
+            # Ignore "No Course Selected", remark rows, headers, etc.
+            if not re.match(r"^[A-Za-z]{2,}\d+\*?$", code or ""):
+                continue
+            if not name:
+                continue
+
+            course = {
                 "code": code,
                 "name": name,
                 "quota": maybe_int(cell_text(quota_i)),
-                "applicant": maybe_int(cell_text(applicant_i)) if applicant_i is not None else None,
+                "applicant": (
+                    maybe_int(cell_text(applicant_i))
+                    if applicant_i is not None
+                    else None
+                ),
                 "option": cell_text(option_i),
-            })
+                "state": "selected" if is_selected_table else "available",
+            }
 
-        if len(parsed) > len(best):
-            best = parsed
-            best_has_applicant = applicant_i is not None
+            key = f"{code}|{name}"
+            # Prefer selected-table copy if the page ever contains both.
+            if key not in merged or is_selected_table:
+                merged[key] = course
 
-    return best, best_has_applicant
+    return list(merged.values()), any_applicant
 
 def write_live_csv(path: Path, courses: list[dict[str, Any]]) -> None:
     """Atomically replace the latest live CSV so readers never see half a file."""
     tmp = path.with_suffix(".tmp")
-    fields = ["code", "name", "quota", "applicant", "option"]
+    fields = ["code", "name", "quota", "applicant", "state", "option"]
     with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -693,7 +728,8 @@ def update_live_view(
                 delta = "初始" if old is None else f"{applicant - old:+d}"
                 print(
                     f"  {course.get('code',''):<10} "
-                    f"{course.get('name','')[:52]:<52} "
+                    f"{course.get('name','')[:48]:<48} "
+                    f"[{course.get('state','?')}] "
                     f"申请 {applicant:>4} / "
                     f"{quota if quota is not None else '?':<4}  Δ {delta}"
                 )
